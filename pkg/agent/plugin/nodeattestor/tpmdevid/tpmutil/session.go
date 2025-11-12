@@ -4,11 +4,9 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
-	"io"
 
-	"github.com/google/go-tpm-tools/client"
-	"github.com/google/go-tpm/legacy/tpm2"
-	"github.com/google/go-tpm/tpmutil"
+	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/hashicorp/go-hclog"
 	"github.com/spiffe/spire/pkg/common/plugin/tpmdevid"
 )
@@ -16,7 +14,7 @@ import (
 // ekRSACertificateHandle is the default handle for RSA endorsement key according
 // to the TCG TPM v2.0 Provisioning Guidance, section 7.8
 // https://trustedcomputinggroup.org/resource/tcg-tpm-v2-0-provisioning-guidance/
-const EKCertificateHandleRSA = tpmutil.Handle(0x01c00002)
+const EKCertificateHandleRSA = tpm2.TPMHandle(0x01c00002)
 
 // randomPasswordSize is the number of bytes of generated random passwords
 const randomPasswordSize = 32
@@ -27,14 +25,14 @@ const randomPasswordSize = 32
 type Session struct {
 	devID    *SigningKey
 	ak       *SigningKey
-	ekHandle tpmutil.Handle
+	ekHandle tpm2.TPMHandle
 	ekPub    []byte
 	akPub    []byte
 
 	endorsementHierarchyPassword string
 	ownerHierarchyPassword       string
 
-	rwc io.ReadWriteCloser
+	tpm transport.TPM
 	log hclog.Logger
 }
 
@@ -64,14 +62,14 @@ func NewSession(scfg *SessionConfig) (*Session, error) {
 	}
 
 	// Open TPM connection
-	rwc, err := OpenTPM(scfg.DevicePath)
+	tpmTransport, err := OpenTPM(scfg.DevicePath)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open TPM at %q: %w", scfg.DevicePath, err)
 	}
 
 	// Create session
-	tpm := &Session{
-		rwc:                          rwc,
+	sess := &Session{
+		tpm:                          tpmTransport,
 		log:                          scfg.Log,
 		endorsementHierarchyPassword: scfg.Passwords.EndorsementHierarchy,
 		ownerHierarchyPassword:       scfg.Passwords.OwnerHierarchy,
@@ -80,7 +78,7 @@ func NewSession(scfg *SessionConfig) (*Session, error) {
 	// Close session in case of error
 	defer func() {
 		if err != nil {
-			tpm.Close()
+			sess.Close()
 		}
 	}()
 
@@ -91,7 +89,7 @@ func NewSession(scfg *SessionConfig) (*Session, error) {
 	}
 
 	// Load DevID
-	tpm.devID, err = tpm.loadKey(
+	sess.devID, err = sess.loadKey(
 		scfg.DevIDPub,
 		scfg.DevIDPriv,
 		srkPassword,
@@ -103,16 +101,16 @@ func NewSession(scfg *SessionConfig) (*Session, error) {
 	// Create Attestation Key
 	akPassword, err := newRandomPassword()
 	if err != nil {
-		return nil, fmt.Errorf("cannot generate random password for attesation key: %w", err)
+		return nil, fmt.Errorf("cannot generate random password for attestation key: %w", err)
 	}
-	akPriv, akPub, err := tpm.createAttestationKey(srkPassword, akPassword)
+	akPriv, akPub, err := sess.createAttestationKey(srkPassword, akPassword)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create attestation key: %w", err)
 	}
-	tpm.akPub = akPub
+	sess.akPub = akPub
 
 	// Load Attestation Key
-	tpm.ak, err = tpm.loadKey(
+	sess.ak, err = sess.loadKey(
 		akPub,
 		akPriv,
 		srkPassword,
@@ -122,17 +120,19 @@ func NewSession(scfg *SessionConfig) (*Session, error) {
 	}
 
 	// Regenerate Endorsement Key using the default RSA template
-	tpm.ekHandle, tpm.ekPub, _, _, _, _, err =
-		tpm2.CreatePrimaryEx(rwc, tpm2.HandleEndorsement,
-			tpm2.PCRSelection{},
-			scfg.Passwords.EndorsementHierarchy,
-			"",
-			client.DefaultEKTemplateRSA())
+	createEKCmd := tpm2.CreatePrimary{
+		PrimaryHandle: tpm2.TPMRHEndorsement,
+		InPublic:      tpm2.New2B(DefaultEKTemplateRSA()),
+	}
+	createEKRsp, err := createEKCmd.Execute(tpmTransport,
+		tpm2.PasswordAuth([]byte(scfg.Passwords.EndorsementHierarchy)))
 	if err != nil {
 		return nil, fmt.Errorf("cannot create endorsement key: %w", err)
 	}
+	sess.ekHandle = createEKRsp.ObjectHandle
+	sess.ekPub = tpm2.Marshal(createEKRsp.OutPublic)
 
-	return tpm, nil
+	return sess, nil
 }
 
 // Close unloads TPM loaded objects and closes the connection to the TPM.
@@ -155,14 +155,16 @@ func (c *Session) Close() {
 		c.flushContext(c.ekHandle)
 	}
 
-	if c.rwc != nil {
-		if closeTPM(c.rwc) {
-			return
-		}
+	if c.tpm != nil {
+		if tpmCloser, ok := c.tpm.(transport.TPMCloser); ok {
+			if closeTPM(tpmCloser) {
+				return
+			}
 
-		err := c.rwc.Close()
-		if err != nil {
-			c.log.Warn(fmt.Sprintf("Failed to close TPM: %v", err))
+			err := tpmCloser.Close()
+			if err != nil {
+				c.log.Warn(fmt.Sprintf("Failed to close TPM: %v", err))
+			}
 		}
 	}
 }
@@ -181,30 +183,27 @@ func (c *Session) SolveDevIDChallenge(nonce []byte) ([]byte, error) {
 // SolveCredActivationChallenge runs credential activation on the TPM. It proves
 // that the attestation key resides on the same TPM as the endorsement key.
 func (c *Session) SolveCredActivationChallenge(credentialBlob, secret []byte) ([]byte, error) {
-	hSession, err := c.createPolicySessionForEK()
+	policySession, cleanup, err := c.createPolicySessionForEK()
 	if err != nil {
 		return nil, err
 	}
+	defer cleanup()
 
-	b, err := tpm2.ActivateCredentialUsingAuth(
-		c.rwc,
-		[]tpm2.AuthCommand{
-			{Session: tpm2.HandlePasswordSession, Auth: []byte(c.ak.password)},
-			{Session: hSession},
-		},
-		c.ak.Handle,
-		c.ekHandle,
-		credentialBlob,
-		secret,
-	)
-	if err != nil {
-		// Flush only in case of error. If the command executes successfully it
-		// closes the session. Closing it again produces an error.
-		c.flushContext(hSession)
-		return b, fmt.Errorf("failed to activate credential: %w", err)
+	activateCmd := tpm2.ActivateCredential{
+		ActivateHandle: c.ak.Handle,
+		KeyHandle:      c.ekHandle,
+		CredentialBlob: tpm2.TPM2BIDObject{Buffer: credentialBlob},
+		Secret:         tpm2.TPM2BEncryptedSecret{Buffer: secret},
 	}
 
-	return b, nil
+	rsp, err := activateCmd.Execute(c.tpm,
+		tpm2.PasswordAuth([]byte(c.ak.password)),
+		policySession)
+	if err != nil {
+		return nil, fmt.Errorf("failed to activate credential: %w", err)
+	}
+
+	return rsp.CertInfo.Buffer, nil
 }
 
 // CertifyDevIDKey proves that the DevID Key is in the same TPM than
@@ -215,10 +214,33 @@ func (c *Session) CertifyDevIDKey() ([]byte, []byte, error) {
 
 // GetEKCert returns TPM endorsement certificate.
 func (c *Session) GetEKCert() ([]byte, error) {
-	ekCertAndTrailingBytes, err := tpm2.NVRead(c.rwc, EKCertificateHandleRSA)
+	// Read the NV index to get the size first
+	readPubCmd := tpm2.NVReadPublic{
+		NVIndex: EKCertificateHandleRSA,
+	}
+	readPubRsp, err := readPubCmd.Execute(c.tpm)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read NV public for index %08x: %w", EKCertificateHandleRSA, err)
+	}
+
+	nvPublic, err := readPubRsp.NVPublic.Contents()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get NV public contents: %w", err)
+	}
+
+	// Read the full certificate
+	nvReadCmd := tpm2.NVRead{
+		AuthHandle: EKCertificateHandleRSA,
+		NVIndex:    EKCertificateHandleRSA,
+		Size:       nvPublic.DataSize,
+		Offset:     0,
+	}
+	nvReadRsp, err := nvReadCmd.Execute(c.tpm, tpm2.PasswordAuth(nil))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read NV index %08x: %w", EKCertificateHandleRSA, err)
 	}
+
+	ekCertAndTrailingBytes := nvReadRsp.Data.Buffer
 
 	// In some TPMs, when we read bytes from an NV index, the content read
 	// includes the DER encoded x.509 certificate + trailing data. We need to
@@ -236,17 +258,7 @@ func (c *Session) GetEKCert() ([]byte, error) {
 // GetEKPublic returns the public part of the Endorsement Key encoded in
 // TPM wire format.
 func (c *Session) GetEKPublic() ([]byte, error) {
-	publicEK, _, _, err := tpm2.ReadPublic(c.rwc, c.ekHandle)
-	if err != nil {
-		return nil, fmt.Errorf("cannot read EK from handle: %w", err)
-	}
-
-	encodedPublicEK, err := publicEK.Encode()
-	if err != nil {
-		return nil, fmt.Errorf("encode failed: %w", err)
-	}
-
-	return encodedPublicEK, nil
+	return c.ekPub, nil
 }
 
 // GetAKPublic returns the public part of the attestation key encoded in
@@ -257,143 +269,162 @@ func (c *Session) GetAKPublic() []byte {
 
 // loadKey loads a key pair into the TPM.
 func (c *Session) loadKey(publicKey, privateKey []byte, parentKeyPassword, keyPassword string) (*SigningKey, error) {
-	pub, err := tpm2.DecodePublic(publicKey)
+	pub, err := tpm2.Unmarshal[tpm2.TPMTPublic](publicKey)
 	if err != nil {
-		return nil, fmt.Errorf("tpm2.DecodePublic failed: %w", err)
+		return nil, fmt.Errorf("failed to unmarshal public key: %w", err)
 	}
 
-	canSign := pub.Attributes&tpm2.FlagSign != 0
+	canSign := pub.ObjectAttributes.SignEncrypt
 	if !canSign {
 		return nil, errors.New("not a signing key")
 	}
 
-	var sigHashAlg tpm2.Algorithm
-	var srkTemplate tpm2.Public
+	var sigHashAlg tpm2.TPMIAlgHash
+	var srkTemplate tpm2.TPMTPublic
 	switch pub.Type {
-	case tpm2.AlgRSA:
-		srkTemplate = SRKTemplateHighRSA()
-		rsaParams := pub.RSAParameters
-		if rsaParams != nil {
-			sigHashAlg = rsaParams.Sign.Hash
+	case tpm2.TPMAlgRSA:
+		srkTemplate = SRKTemplateRSA()
+		rsaParams, err := pub.Parameters.RSADetail()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get RSA parameters: %w", err)
+		}
+		sigScheme, err := rsaParams.Scheme.Details.RSASSA()
+		if err == nil {
+			sigHashAlg = sigScheme.HashAlg
 		}
 
-	case tpm2.AlgECC:
-		srkTemplate = SRKTemplateHighECC()
-		eccParams := pub.ECCParameters
-		if eccParams != nil {
-			sigHashAlg = eccParams.Sign.Hash
+	case tpm2.TPMAlgECC:
+		srkTemplate = SRKTemplateECC()
+		eccParams, err := pub.Parameters.ECCDetail()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get ECC parameters: %w", err)
+		}
+		sigScheme, err := eccParams.Scheme.Details.ECDSA()
+		if err == nil {
+			sigHashAlg = sigScheme.HashAlg
 		}
 
 	default:
 		return nil, fmt.Errorf("bad key type: 0x%04x", pub.Type)
 	}
 
-	if sigHashAlg.IsNull() {
+	if sigHashAlg == tpm2.TPMAlgNull {
 		return nil, errors.New("signature hash algorithm is NULL")
 	}
 
-	srkHandle, _, _, _, _, _, err :=
-		tpm2.CreatePrimaryEx(c.rwc, tpm2.HandleOwner,
-			tpm2.PCRSelection{},
-			c.ownerHierarchyPassword,
-			parentKeyPassword,
-			srkTemplate)
-	if err != nil {
-		return nil, fmt.Errorf("tpm2.CreatePrimaryEx failed: %w", err)
+	// Create SRK
+	createSRKCmd := tpm2.CreatePrimary{
+		PrimaryHandle: tpm2.TPMRHOwner,
+		InPublic:      tpm2.New2B(srkTemplate),
 	}
-	defer c.flushContext(srkHandle)
-
-	keyHandle, _, err := tpm2.Load(c.rwc, srkHandle, parentKeyPassword, publicKey, privateKey)
+	createSRKRsp, err := createSRKCmd.Execute(c.tpm,
+		tpm2.PasswordAuth([]byte(c.ownerHierarchyPassword)),
+		tpm2.HMAC(tpm2.TPMAlgSHA256, 16, tpm2.Auth([]byte(parentKeyPassword))))
 	if err != nil {
-		return nil, fmt.Errorf("tpm2.Load failed: %w", err)
+		return nil, fmt.Errorf("failed to create SRK: %w", err)
+	}
+	defer c.flushContext(createSRKRsp.ObjectHandle)
+
+	// Load the key
+	loadCmd := tpm2.Load{
+		ParentHandle: tpm2.AuthHandle{
+			Handle: createSRKRsp.ObjectHandle,
+			Name:   createSRKRsp.Name,
+			Auth:   tpm2.PasswordAuth([]byte(parentKeyPassword)),
+		},
+		InPrivate: tpm2.TPM2BPrivate{Buffer: privateKey},
+		InPublic:  tpm2.BytesAs2B[tpm2.TPMTPublic](publicKey),
+	}
+	loadRsp, err := loadCmd.Execute(c.tpm)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load key: %w", err)
 	}
 
 	return &SigningKey{
-		Handle:     keyHandle,
+		Handle:     loadRsp.ObjectHandle,
+		Name:       loadRsp.Name,
 		sigHashAlg: sigHashAlg,
-		rw:         c.rwc,
+		tpm:        c.tpm,
 		log:        c.log,
 		password:   keyPassword,
 	}, nil
 }
 
 func (c *Session) createAttestationKey(parentKeyPassword, keyPassword string) ([]byte, []byte, error) {
-	srkHandle, _, _, _, _, _, err :=
-		tpm2.CreatePrimaryEx(c.rwc,
-			tpm2.HandleOwner,
-			tpm2.PCRSelection{},
-			c.ownerHierarchyPassword,
-			parentKeyPassword,
-			SRKTemplateHighRSA())
+	// Create SRK
+	createSRKCmd := tpm2.CreatePrimary{
+		PrimaryHandle: tpm2.TPMRHOwner,
+		InPublic:      tpm2.New2B(SRKTemplateRSA()),
+	}
+	createSRKRsp, err := createSRKCmd.Execute(c.tpm,
+		tpm2.PasswordAuth([]byte(c.ownerHierarchyPassword)),
+		tpm2.HMAC(tpm2.TPMAlgSHA256, 16, tpm2.Auth([]byte(parentKeyPassword))))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create SRK: %w", err)
 	}
-	defer c.flushContext(srkHandle)
+	defer c.flushContext(createSRKRsp.ObjectHandle)
 
-	privBlob, pubBlob, _, _, _, err := tpm2.CreateKey(
-		c.rwc,
-		srkHandle,
-		tpm2.PCRSelection{},
-		parentKeyPassword,
-		keyPassword,
-		client.AKTemplateRSA(),
-	)
+	// Create AK
+	createAKCmd := tpm2.Create{
+		ParentHandle: tpm2.AuthHandle{
+			Handle: createSRKRsp.ObjectHandle,
+			Name:   createSRKRsp.Name,
+			Auth:   tpm2.PasswordAuth([]byte(parentKeyPassword)),
+		},
+		InPublic: tpm2.New2B(AKTemplateRSA()),
+		InSensitive: tpm2.TPM2BSensitiveCreate{
+			Sensitive: &tpm2.TPMSSensitiveCreate{
+				UserAuth: tpm2.TPM2BAuth{
+					Buffer: []byte(keyPassword),
+				},
+			},
+		},
+	}
+	createAKRsp, err := createAKCmd.Execute(c.tpm)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create AK: %w", err)
 	}
 
-	return privBlob, pubBlob, nil
+	return createAKRsp.OutPrivate.Buffer, tpm2.Marshal(createAKRsp.OutPublic), nil
 }
 
 // createPolicySessionForEK creates a session-based authorization to access EK.
 // We need a session-based authorization to run the activate credential command
 // (password-based auth is not enough) because of the attributes of the EK template.
-func (c *Session) createPolicySessionForEK() (tpmutil.Handle, error) {
+// Returns the session and a cleanup function.
+func (c *Session) createPolicySessionForEK() (tpm2.Session, func(), error) {
 	// The TPM is accessed in a plain session (we assume the bus is trusted) so we use an:
 	// un-bounded and un-salted policy session (bindKey = HandleNull, tpmKey = HandleNull, secret = nil,
 	// (sym = algNull, nonceCaller = all zeros).
 
-	// A detailed description of this command and its parameters can be found in TCG spec:
-	// https://www.trustedcomputinggroup.org/wp-content/uploads/TPM-Rev-2.0-Part-3-Commands-01.38.pdf#page=52
-	hSession, _, err := tpm2.StartAuthSession(
-		c.rwc,              // rw:		TPM channel.
-		tpm2.HandleNull,    // tpmKey:		Handle to a key to do the decryption of encryptedSalt.
-		tpm2.HandleNull,    // bindKey:		Handle to a key to bind this session to (concatenates to salt).
-		make([]byte, 16),   // nonceCaller:	Initial nonce from the caller.
-		nil,                // secret:		Encrypted salt.
-		tpm2.SessionPolicy, // se:		Session type.
-		tpm2.AlgNull,       // sym:		The type of parameter encryption that will be used when the session is set for encrypt or decrypt.
-		tpm2.AlgSHA256,     // hashAlg:		The hash algorithm used in computation of the policy digest.
-	)
-	if err != nil {
-		return 0, err
+	// Create a policy session that applies policy secret for endorsement hierarchy
+	policyCallback := func(tpm transport.TPM, handle tpm2.TPMISHPolicy, nonceTPM tpm2.TPM2BNonce) error {
+		// Apply policy secret to authorize with endorsement hierarchy
+		policySecretCmd := tpm2.PolicySecret{
+			AuthHandle: tpm2.AuthHandle{
+				Handle: tpm2.TPMRHEndorsement,
+				Auth:   tpm2.PasswordAuth([]byte(c.endorsementHierarchyPassword)),
+			},
+			PolicySession: handle,
+		}
+		_, err := policySecretCmd.Execute(tpm)
+		return err
 	}
 
-	// A detailed description of this command and its parameters can be found in TCG spec:
-	// https://www.trustedcomputinggroup.org/wp-content/uploads/TPM-Rev-2.0-Part-3-Commands-01.38.pdf#page=228
-	_, _, err = tpm2.PolicySecret(
-		c.rwc,                  // 	rw:		TPM channel.
-		tpm2.HandleEndorsement, // 	entityHandle:	handle for an entity providing the authorization.
-		tpm2.AuthCommand{ // 		entityAuth:	entity authorization.
-			Session: tpm2.HandlePasswordSession,
-			Auth:    []byte(c.endorsementHierarchyPassword),
-		},
-		hSession, // policyHandle:	Handle for the policy session being extended.
-		nil,      // policyNonce:	The policy nonce for the session (can be the Empty Buffer).
-		nil,      // cpHash:		Digest of the command parameters to which this authorization is limited (if it is not limited, the parameter will be the Empty Buffer).
-		nil,      // policyRef:		Reference to a policy relating to the authorization.
-		0,        // expiry: 		Time when authorization will expire measured in seconds (zero means no expiration).
-	)
-	if err != nil {
-		c.flushContext(hSession)
-		return 0, err
-	}
+	// Create session object with the policy callback
+	session := tpm2.Policy(tpm2.TPMAlgSHA256, 16, policyCallback)
 
-	return hSession, nil
+	// No cleanup needed - the Policy session is ephemeral and cleaned up automatically
+	cleanup := func() {}
+
+	return session, cleanup, nil
 }
 
-func (c *Session) flushContext(handle tpmutil.Handle) {
-	err := tpm2.FlushContext(c.rwc, handle)
+func (c *Session) flushContext(handle tpm2.TPMHandle) {
+	flushCmd := tpm2.FlushContext{
+		FlushHandle: handle,
+	}
+	_, err := flushCmd.Execute(c.tpm)
 	if err != nil {
 		c.log.Warn(fmt.Sprintf("Failed to flush handle %v: %v", handle, err))
 	}
