@@ -389,11 +389,13 @@ func (s *TPMSimulator) createEndorsementCertificate() (*x509.Certificate, error)
 
 	// Create EK using the new API
 	createEKCmd := tpm2.CreatePrimary{
-		PrimaryHandle: tpm2.TPMRHEndorsement,
-		InPublic:      tpm2.New2B(tpmutil.DefaultEKTemplateRSA()),
+		PrimaryHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHEndorsement,
+			Auth:   tpm2.PasswordAuth([]byte(s.endorsementHierarchyPassword)),
+		},
+		InPublic: tpm2.New2B(tpmutil.DefaultEKTemplateRSA()),
 	}
-	createEKRsp, err := createEKCmd.Execute(s.tpm,
-		tpm2.PasswordAuth([]byte(s.endorsementHierarchyPassword)))
+	createEKRsp, err := createEKCmd.Execute(s.tpm)
 	if err != nil {
 		return nil, fmt.Errorf("cannot generate endorsement key pair: %w", err)
 	}
@@ -456,12 +458,20 @@ func (s *TPMSimulator) createOrdinaryKey(keyType KeyType, parentKeyPassword, key
 
 	// Create SRK
 	createSRKCmd := tpm2.CreatePrimary{
-		PrimaryHandle: tpm2.TPMRHOwner,
-		InPublic:      tpm2.New2B(srkTemplate),
+		PrimaryHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHOwner,
+			Auth:   tpm2.PasswordAuth([]byte(s.ownerHierarchyPassword)),
+		},
+		InPublic: tpm2.New2B(srkTemplate),
+		InSensitive: tpm2.TPM2BSensitiveCreate{
+			Sensitive: &tpm2.TPMSSensitiveCreate{
+				UserAuth: tpm2.TPM2BAuth{
+					Buffer: []byte(parentKeyPassword),
+				},
+			},
+		},
 	}
-	createSRKRsp, err := createSRKCmd.Execute(s.tpm,
-		tpm2.PasswordAuth([]byte(s.ownerHierarchyPassword)),
-		tpm2.HMAC(tpm2.TPMAlgSHA256, 16, tpm2.Auth([]byte(parentKeyPassword))))
+	createSRKRsp, err := createSRKCmd.Execute(s.tpm)
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot create new storage root key: %w", err)
 	}
