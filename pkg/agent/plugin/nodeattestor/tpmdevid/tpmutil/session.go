@@ -26,6 +26,7 @@ type Session struct {
 	devID    *SigningKey
 	ak       *SigningKey
 	ekHandle tpm2.TPMHandle
+	ekName   tpm2.TPM2BName
 	ekPub    []byte
 	akPub    []byte
 
@@ -132,6 +133,7 @@ func NewSession(scfg *SessionConfig) (*Session, error) {
 		return nil, fmt.Errorf("cannot create endorsement key: %w", err)
 	}
 	sess.ekHandle = createEKRsp.ObjectHandle
+	sess.ekName = createEKRsp.Name
 
 	// Get the inner TPMTPublic from the TPM2BPublic wrapper
 	ekPublicContents, err := createEKRsp.OutPublic.Contents()
@@ -198,15 +200,21 @@ func (c *Session) SolveCredActivationChallenge(credentialBlob, secret []byte) ([
 	defer cleanup()
 
 	activateCmd := tpm2.ActivateCredential{
-		ActivateHandle: c.ak.Handle,
-		KeyHandle:      c.ekHandle,
+		ActivateHandle: tpm2.AuthHandle{
+			Handle: c.ak.Handle,
+			Name:   c.ak.Name,
+			Auth:   tpm2.PasswordAuth([]byte(c.ak.password)),
+		},
+		KeyHandle: tpm2.AuthHandle{
+			Handle: c.ekHandle,
+			Name:   c.ekName,
+			Auth:   policySession,
+		},
 		CredentialBlob: tpm2.TPM2BIDObject{Buffer: credentialBlob},
 		Secret:         tpm2.TPM2BEncryptedSecret{Buffer: secret},
 	}
 
-	rsp, err := activateCmd.Execute(c.tpm,
-		tpm2.PasswordAuth([]byte(c.ak.password)),
-		policySession)
+	rsp, err := activateCmd.Execute(c.tpm)
 	if err != nil {
 		return nil, fmt.Errorf("failed to activate credential: %w", err)
 	}
@@ -217,7 +225,7 @@ func (c *Session) SolveCredActivationChallenge(credentialBlob, secret []byte) ([
 // CertifyDevIDKey proves that the DevID Key is in the same TPM than
 // Attestation Key.
 func (c *Session) CertifyDevIDKey() ([]byte, []byte, error) {
-	return c.ak.Certify(c.devID.Handle, c.devID.password)
+	return c.ak.Certify(c.devID.Handle, c.devID.Name, c.devID.password)
 }
 
 // GetEKCert returns TPM endorsement certificate.
@@ -238,12 +246,19 @@ func (c *Session) GetEKCert() ([]byte, error) {
 
 	// Read the full certificate
 	nvReadCmd := tpm2.NVRead{
-		AuthHandle: EKCertificateHandleRSA,
-		NVIndex:    EKCertificateHandleRSA,
-		Size:       nvPublic.DataSize,
-		Offset:     0,
+		AuthHandle: tpm2.AuthHandle{
+			Handle: EKCertificateHandleRSA,
+			Name:   readPubRsp.NVName,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+		NVIndex: tpm2.NamedHandle{
+			Handle: EKCertificateHandleRSA,
+			Name:   readPubRsp.NVName,
+		},
+		Size:   nvPublic.DataSize,
+		Offset: 0,
 	}
-	nvReadRsp, err := nvReadCmd.Execute(c.tpm, tpm2.PasswordAuth(nil))
+	nvReadRsp, err := nvReadCmd.Execute(c.tpm)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read NV index %08x: %w", EKCertificateHandleRSA, err)
 	}

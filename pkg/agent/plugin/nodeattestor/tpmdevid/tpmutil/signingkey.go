@@ -53,9 +53,10 @@ func (k *SigningKey) Sign(data []byte) ([]byte, error) {
 
 	for i := 1; i <= maxAttempts; i++ {
 		signCmd := tpm2.Sign{
-			KeyHandle: tpm2.NamedHandle{
+			KeyHandle: tpm2.AuthHandle{
 				Handle: k.Handle,
 				Name:   k.Name,
+				Auth:   tpm2.PasswordAuth([]byte(k.password)),
 			},
 			Digest: tpm2.TPM2BDigest{
 				Buffer: hashRsp.OutHash.Buffer,
@@ -68,7 +69,7 @@ func (k *SigningKey) Sign(data []byte) ([]byte, error) {
 			},
 		}
 
-		signRsp, err := signCmd.Execute(k.tpm, tpm2.PasswordAuth([]byte(k.password)))
+		signRsp, err := signCmd.Execute(k.tpm)
 		switch {
 		case err == nil:
 			return getSignatureBytes(&signRsp.Signature)
@@ -88,7 +89,7 @@ func (k *SigningKey) Sign(data []byte) ([]byte, error) {
 
 // Certify calls tpm2.Certify using the current key as signer and the provided
 // handle as object.
-func (k *SigningKey) Certify(objectHandle tpm2.TPMHandle, objectPassword string) ([]byte, []byte, error) {
+func (k *SigningKey) Certify(objectHandle tpm2.TPMHandle, objectName tpm2.TPM2BName, objectPassword string) ([]byte, []byte, error) {
 	// For some reason 'tpm2.Certify()' sometimes fails the first attempt and asks for retry.
 	// So, we retry in case of getting the RCRetry error.
 	// It seems that this issue has been reported: https://github.com/google/go-tpm/issues/59
@@ -96,11 +97,13 @@ func (k *SigningKey) Certify(objectHandle tpm2.TPMHandle, objectPassword string)
 		certifyCmd := tpm2.Certify{
 			ObjectHandle: tpm2.AuthHandle{
 				Handle: objectHandle,
+				Name:   objectName,
 				Auth:   tpm2.PasswordAuth([]byte(objectPassword)),
 			},
-			SignHandle: tpm2.NamedHandle{
+			SignHandle: tpm2.AuthHandle{
 				Handle: k.Handle,
 				Name:   k.Name,
+				Auth:   tpm2.PasswordAuth([]byte(k.password)),
 			},
 			QualifyingData: tpm2.TPM2BData{},
 			InScheme: tpm2.TPMTSigScheme{
@@ -108,8 +111,7 @@ func (k *SigningKey) Certify(objectHandle tpm2.TPMHandle, objectPassword string)
 			},
 		}
 
-		certifyRsp, err := certifyCmd.Execute(k.tpm,
-			tpm2.PasswordAuth([]byte(k.password)))
+		certifyRsp, err := certifyCmd.Execute(k.tpm)
 		switch {
 		case err == nil:
 			return tpm2.Marshal(certifyRsp.CertifyInfo), tpm2.Marshal(certifyRsp.Signature), nil
