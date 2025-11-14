@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"runtime"
 	"testing"
 
-	"github.com/google/go-tpm/legacy/tpm2"
+	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/hashicorp/go-hclog"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
@@ -42,6 +44,19 @@ var (
 	}
 )
 
+// tpmCloser wraps a transport.TPM and io.Closer to implement transport.TPMCloser
+type tpmCloser struct {
+	transport.TPM
+	io.Closer
+}
+
+func newTPMCloser(rwc io.ReadWriteCloser) transport.TPMCloser {
+	return &tpmCloser{
+		TPM:    transport.FromReadWriter(rwc),
+		Closer: rwc,
+	}
+}
+
 func setupSimulator(t *testing.T, provisioningCA *tpmsimulator.ProvisioningAuthority) *tpmsimulator.TPMSimulator {
 	// Creates a new global TPM simulator
 	sim, err := tpmsimulator.New(tpmPasswords.EndorsementHierarchy, tpmPasswords.OwnerHierarchy)
@@ -49,7 +64,13 @@ func setupSimulator(t *testing.T, provisioningCA *tpmsimulator.ProvisioningAutho
 	t.Cleanup(func() {
 		assert.NoError(t, sim.Close(), "unexpected error encountered closing simulator")
 	})
-	tpmutil.OpenTPM = sim.OpenTPM
+	tpmutil.OpenTPM = func(s ...string) (transport.TPMCloser, error) {
+		rwc, err := sim.OpenTPM(s...)
+		if err != nil {
+			return nil, err
+		}
+		return newTPMCloser(rwc), nil
+	}
 
 	// Create a temporal directory to store configuration files
 	dir := t.TempDir()
@@ -401,12 +422,10 @@ func TestAttestFailiures(t *testing.T) {
 					// Corrupt AK to induce an error that make generation of
 					// credential activation challenge to fail.
 					akBytes := akPub
-					ak, err := tpm2.DecodePublic(akBytes)
+					ak, err := tpm2.Unmarshal[tpm2.TPMTPublic](akBytes)
 					require.NoError(t, err)
-					ak.NameAlg = tpm2.AlgNull
-					modifiedAKBytes, err := ak.Encode()
-					require.NoError(t, err)
-					return modifiedAKBytes
+					ak.NameAlg = tpm2.TPMAlgNull
+					return tpm2.Marshal(ak)
 				}(),
 			}),
 		},

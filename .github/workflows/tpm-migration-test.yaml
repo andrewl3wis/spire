@@ -127,6 +127,8 @@ jobs:
           go build -v ./test/tpmsimulator/...
 
       - name: Run TPM Unit Tests (windows/amd64)
+        env:
+          CGO_ENABLED: 0
         run: |
           Write-Host "Running TPM unit tests"
           go test -v ./pkg/agent/plugin/nodeattestor/tpmdevid/...
