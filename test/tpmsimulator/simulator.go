@@ -86,12 +86,15 @@ func New(endorsementHierarchyPassword, ownerHierarchyPassword string) (*TPMSimul
 	}
 
 	hierarchyAuthCmd := tpm2.HierarchyChangeAuth{
-		AuthHandle: tpm2.TPMRHEndorsement,
+		AuthHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHEndorsement,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
 		NewAuth: tpm2.TPM2BAuth{
 			Buffer: []byte(sim.endorsementHierarchyPassword),
 		},
 	}
-	_, err = hierarchyAuthCmd.Execute(sim.tpm, tpm2.PasswordAuth(nil))
+	_, err = hierarchyAuthCmd.Execute(sim.tpm)
 	if err != nil {
 		return nil, fmt.Errorf("unable to change endorsement hierarchy auth: %w", err)
 	}
@@ -107,12 +110,15 @@ func New(endorsementHierarchyPassword, ownerHierarchyPassword string) (*TPMSimul
 	}
 
 	ownerAuthCmd := tpm2.HierarchyChangeAuth{
-		AuthHandle: tpm2.TPMRHOwner,
+		AuthHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHOwner,
+			Auth:   tpm2.PasswordAuth([]byte(sim.endorsementHierarchyPassword)),
+		},
 		NewAuth: tpm2.TPM2BAuth{
 			Buffer: []byte(sim.ownerHierarchyPassword),
 		},
 	}
-	_, err = ownerAuthCmd.Execute(sim.tpm, tpm2.PasswordAuth([]byte(sim.endorsementHierarchyPassword)))
+	_, err = ownerAuthCmd.Execute(sim.tpm)
 	if err != nil {
 		return nil, fmt.Errorf("unable to change owner hierarchy auth: %w", err)
 	}
@@ -302,14 +308,23 @@ func (s *TPMSimulator) GetEKRoot() *x509.Certificate {
 func (s *TPMSimulator) SetEndorsementCertificate(ekCert []byte) error {
 	// Try to undefine the space if it already exists (ignore errors)
 	undefineCmd := tpm2.NVUndefineSpace{
-		AuthHandle: tpm2.TPMRHPlatform,
-		NVIndex:    tpmutil.EKCertificateHandleRSA,
+		AuthHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHPlatform,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+		NVIndex: tpm2.NamedHandle{
+			Handle: tpmutil.EKCertificateHandleRSA,
+			Name:   tpm2.TPM2BName{},
+		},
 	}
-	_, _ = undefineCmd.Execute(s.tpm, tpm2.PasswordAuth(nil))
+	_, _ = undefineCmd.Execute(s.tpm)
 
 	// Define NV space for EK certificate
 	defineCmd := tpm2.NVDefineSpace{
-		AuthHandle: tpm2.TPMRHPlatform,
+		AuthHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHPlatform,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
 		Auth: tpm2.TPM2BAuth{
 			Buffer: nil,
 		},
@@ -328,21 +343,27 @@ func (s *TPMSimulator) SetEndorsementCertificate(ekCert []byte) error {
 			DataSize:   uint16(len(ekCert)),
 		}),
 	}
-	_, err := defineCmd.Execute(s.tpm, tpm2.PasswordAuth(nil))
+	_, err := defineCmd.Execute(s.tpm)
 	if err != nil {
 		return fmt.Errorf("cannot define NV space: %w", err)
 	}
 
 	// Write EK certificate to NV space
 	writeCmd := tpm2.NVWrite{
-		AuthHandle: tpm2.TPMRHPlatform,
-		NVIndex:    tpmutil.EKCertificateHandleRSA,
+		AuthHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHPlatform,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+		NVIndex: tpm2.NamedHandle{
+			Handle: tpmutil.EKCertificateHandleRSA,
+			Name:   tpm2.TPM2BName{},
+		},
 		Data: tpm2.TPM2BMaxNVBuffer{
 			Buffer: ekCert,
 		},
 		Offset: 0,
 	}
-	_, err = writeCmd.Execute(s.tpm, tpm2.PasswordAuth(nil))
+	_, err = writeCmd.Execute(s.tpm)
 	if err != nil {
 		return fmt.Errorf("cannot write data to NV: %w", err)
 	}
