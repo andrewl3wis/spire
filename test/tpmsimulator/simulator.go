@@ -112,7 +112,7 @@ func New(endorsementHierarchyPassword, ownerHierarchyPassword string) (*TPMSimul
 	ownerAuthCmd := tpm2.HierarchyChangeAuth{
 		AuthHandle: tpm2.AuthHandle{
 			Handle: tpm2.TPMRHOwner,
-			Auth:   tpm2.PasswordAuth([]byte(sim.endorsementHierarchyPassword)),
+			Auth:   tpm2.PasswordAuth(nil),
 		},
 		NewAuth: tpm2.TPM2BAuth{
 			Buffer: []byte(sim.ownerHierarchyPassword),
@@ -506,7 +506,13 @@ func (s *TPMSimulator) createOrdinaryKey(keyType KeyType, parentKeyPassword, key
 		return nil, nil, fmt.Errorf("cannot flush storage root key handle: %w", err)
 	}
 
-	return createKeyRsp.OutPrivate.Buffer, tpm2.Marshal(createKeyRsp.OutPublic), nil
+	// Get the inner TPMTPublic from the TPM2BPublic wrapper
+	publicContents, err := createKeyRsp.OutPublic.Contents()
+	if err != nil {
+		return nil, nil, fmt.Errorf("cannot get public key contents: %w", err)
+	}
+
+	return createKeyRsp.OutPrivate.Buffer, tpm2.Marshal(*publicContents), nil
 }
 
 func (p *ProvisioningAuthority) issueCertificate(publicKey any) (*x509.Certificate, error) {

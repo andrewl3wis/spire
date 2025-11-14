@@ -121,16 +121,24 @@ func NewSession(scfg *SessionConfig) (*Session, error) {
 
 	// Regenerate Endorsement Key using the default RSA template
 	createEKCmd := tpm2.CreatePrimary{
-		PrimaryHandle: tpm2.TPMRHEndorsement,
-		InPublic:      tpm2.New2B(DefaultEKTemplateRSA()),
+		PrimaryHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHEndorsement,
+			Auth:   tpm2.PasswordAuth([]byte(scfg.Passwords.EndorsementHierarchy)),
+		},
+		InPublic: tpm2.New2B(DefaultEKTemplateRSA()),
 	}
-	createEKRsp, err := createEKCmd.Execute(tpmTransport,
-		tpm2.PasswordAuth([]byte(scfg.Passwords.EndorsementHierarchy)))
+	createEKRsp, err := createEKCmd.Execute(tpmTransport)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create endorsement key: %w", err)
 	}
 	sess.ekHandle = createEKRsp.ObjectHandle
-	sess.ekPub = tpm2.Marshal(createEKRsp.OutPublic)
+
+	// Get the inner TPMTPublic from the TPM2BPublic wrapper
+	ekPublicContents, err := createEKRsp.OutPublic.Contents()
+	if err != nil {
+		return nil, fmt.Errorf("cannot get EK public key contents: %w", err)
+	}
+	sess.ekPub = tpm2.Marshal(*ekPublicContents)
 
 	return sess, nil
 }
@@ -314,12 +322,20 @@ func (c *Session) loadKey(publicKey, privateKey []byte, parentKeyPassword, keyPa
 
 	// Create SRK
 	createSRKCmd := tpm2.CreatePrimary{
-		PrimaryHandle: tpm2.TPMRHOwner,
-		InPublic:      tpm2.New2B(srkTemplate),
+		PrimaryHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHOwner,
+			Auth:   tpm2.PasswordAuth([]byte(c.ownerHierarchyPassword)),
+		},
+		InPublic: tpm2.New2B(srkTemplate),
+		InSensitive: tpm2.TPM2BSensitiveCreate{
+			Sensitive: &tpm2.TPMSSensitiveCreate{
+				UserAuth: tpm2.TPM2BAuth{
+					Buffer: []byte(parentKeyPassword),
+				},
+			},
+		},
 	}
-	createSRKRsp, err := createSRKCmd.Execute(c.tpm,
-		tpm2.PasswordAuth([]byte(c.ownerHierarchyPassword)),
-		tpm2.HMAC(tpm2.TPMAlgSHA256, 16, tpm2.Auth([]byte(parentKeyPassword))))
+	createSRKRsp, err := createSRKCmd.Execute(c.tpm)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create SRK: %w", err)
 	}
@@ -353,12 +369,20 @@ func (c *Session) loadKey(publicKey, privateKey []byte, parentKeyPassword, keyPa
 func (c *Session) createAttestationKey(parentKeyPassword, keyPassword string) ([]byte, []byte, error) {
 	// Create SRK
 	createSRKCmd := tpm2.CreatePrimary{
-		PrimaryHandle: tpm2.TPMRHOwner,
-		InPublic:      tpm2.New2B(SRKTemplateRSA()),
+		PrimaryHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHOwner,
+			Auth:   tpm2.PasswordAuth([]byte(c.ownerHierarchyPassword)),
+		},
+		InPublic: tpm2.New2B(SRKTemplateRSA()),
+		InSensitive: tpm2.TPM2BSensitiveCreate{
+			Sensitive: &tpm2.TPMSSensitiveCreate{
+				UserAuth: tpm2.TPM2BAuth{
+					Buffer: []byte(parentKeyPassword),
+				},
+			},
+		},
 	}
-	createSRKRsp, err := createSRKCmd.Execute(c.tpm,
-		tpm2.PasswordAuth([]byte(c.ownerHierarchyPassword)),
-		tpm2.HMAC(tpm2.TPMAlgSHA256, 16, tpm2.Auth([]byte(parentKeyPassword))))
+	createSRKRsp, err := createSRKCmd.Execute(c.tpm)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create SRK: %w", err)
 	}
@@ -385,7 +409,13 @@ func (c *Session) createAttestationKey(parentKeyPassword, keyPassword string) ([
 		return nil, nil, fmt.Errorf("failed to create AK: %w", err)
 	}
 
-	return createAKRsp.OutPrivate.Buffer, tpm2.Marshal(createAKRsp.OutPublic), nil
+	// Get the inner TPMTPublic from the TPM2BPublic wrapper
+	publicContents, err := createAKRsp.OutPublic.Contents()
+	if err != nil {
+		return nil, nil, fmt.Errorf("cannot get AK public key contents: %w", err)
+	}
+
+	return createAKRsp.OutPrivate.Buffer, tpm2.Marshal(*publicContents), nil
 }
 
 // createPolicySessionForEK creates a session-based authorization to access EK.
