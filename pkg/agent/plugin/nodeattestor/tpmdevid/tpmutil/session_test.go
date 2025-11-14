@@ -10,8 +10,8 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/google/go-tpm-tools/client"
-	"github.com/google/go-tpm/legacy/tpm2"
+	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/hashicorp/go-hclog"
 	"github.com/spiffe/spire/pkg/agent/plugin/nodeattestor/tpmdevid/tpmutil"
 	server_devid "github.com/spiffe/spire/pkg/server/plugin/nodeattestor/tpmdevid"
@@ -34,6 +34,19 @@ var (
 	isWindows = runtime.GOOS == "windows"
 )
 
+// tpmCloser wraps a transport.TPM and io.Closer to implement transport.TPMCloser
+type tpmCloser struct {
+	transport.TPM
+	io.Closer
+}
+
+func newTPMCloser(rwc io.ReadWriteCloser) transport.TPMCloser {
+	return &tpmCloser{
+		TPM:    transport.FromReadWriter(rwc),
+		Closer: rwc,
+	}
+}
+
 func setupSimulator(t *testing.T) *tpmsimulator.TPMSimulator {
 	// Create a new TPM simulator
 	sim, err := tpmsimulator.New(tpmPasswords.EndorsementHierarchy, tpmPasswords.OwnerHierarchy)
@@ -41,8 +54,12 @@ func setupSimulator(t *testing.T) *tpmsimulator.TPMSimulator {
 	t.Cleanup(func() {
 		assert.NoError(t, sim.Close(), "failed to close the TPM simulator")
 	})
-	tpmutil.OpenTPM = func(s ...string) (io.ReadWriteCloser, error) {
-		return sim.OpenTPM(s...)
+	tpmutil.OpenTPM = func(s ...string) (transport.TPMCloser, error) {
+		rwc, err := sim.OpenTPM(s...)
+		if err != nil {
+			return nil, err
+		}
+		return newTPMCloser(rwc), nil
 	}
 
 	// Create DevIDs
@@ -83,14 +100,14 @@ func TestNewSession(t *testing.T) {
 		{
 			name:          "NewSession fails if a wrong device path is provided",
 			expErr:        `cannot open TPM at "": unexpected TPM device path "" (expected "/dev/tpmrm0")`,
-			expWindowsErr: "cannot load DevID key on TPM: tpm2.DecodePublic failed: decoding TPMT_PUBLIC: EOF",
+			expWindowsErr: "cannot load DevID key on TPM: unmarshaling TPMT_PUBLIC: EOF",
 			scfg: &tpmutil.SessionConfig{
 				Log: hclog.NewNullLogger(),
 			},
 		},
 		{
 			name:   "NewSesion fails if DevID blobs cannot be loaded",
-			expErr: "cannot load DevID key on TPM: tpm2.DecodePublic failed: decoding TPMT_PUBLIC: unexpected EOF",
+			expErr: "cannot load DevID key on TPM: unmarshaling TPMT_PUBLIC: unexpected EOF",
 			scfg: &tpmutil.SessionConfig{
 				DevicePath: "/dev/tpmrm0",
 				DevIDPriv:  []byte("not a private key blob"),
@@ -293,14 +310,14 @@ func TestSolveCredActivationChallenge(t *testing.T) {
 
 	ekPubBytes, err := tpm.GetEKPublic()
 	require.NoError(t, err)
-	ekPub, err := tpm2.DecodePublic(ekPubBytes)
+	ekPub, err := tpm2.Unmarshal[tpm2.TPMTPublic](ekPubBytes)
 	require.NoError(t, err)
 
 	akPubBytes := tpm.GetAKPublic()
-	akPub, err := tpm2.DecodePublic(akPubBytes)
+	akPub, err := tpm2.Unmarshal[tpm2.TPMTPublic](akPubBytes)
 	require.NoError(t, err)
 
-	challenge, expectedNonce, err := server_devid.NewCredActivationChallenge(akPub, ekPub)
+	challenge, expectedNonce, err := server_devid.NewCredActivationChallenge(*akPub, *ekPub)
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -379,10 +396,10 @@ func TestCertifyDevIDKey(t *testing.T) {
 			defer tpm.Close()
 
 			akPubBytes := tpm.GetAKPublic()
-			akPub, err := tpm2.DecodePublic(akPubBytes)
+			akPub, err := tpm2.Unmarshal[tpm2.TPMTPublic](akPubBytes)
 			require.NoError(t, err)
 
-			devIDPub, err := tpm2.DecodePublic(devIDRSA.PublicBlob)
+			devIDPub, err := tpm2.Unmarshal[tpm2.TPMTPublic](devIDRSA.PublicBlob)
 			require.NoError(t, err)
 
 			attData, signature, err := tpm.CertifyDevIDKey()
@@ -397,7 +414,7 @@ func TestCertifyDevIDKey(t *testing.T) {
 			require.NotNil(t, attData)
 			require.NotNil(t, signature)
 
-			err = server_devid.VerifyDevIDCertification(&akPub, &devIDPub, attData, signature)
+			err = server_devid.VerifyDevIDCertification(*akPub, *devIDPub, attData, signature)
 			require.NoError(t, err)
 		})
 	}
@@ -444,7 +461,18 @@ func TestGetEKCert(t *testing.T) {
 			name:   "GetEKCert fails if TPM has not a EK Cert loaded in default handle",
 			expErr: "failed to read NV index 01c00002: decoding NV_ReadPublic response: handle 1, error code 0xb : the handle is not correct for the use",
 			hook: func() {
-				err := tpm2.NVUndefineSpace(sim, "", tpm2.HandlePlatform, tpmutil.EKCertificateHandleRSA)
+				nvUndefine := tpm2.NVUndefineSpace{
+					AuthHandle: tpm2.AuthHandle{
+						Handle: tpm2.TPMRHPlatform,
+						Auth:   tpm2.PasswordAuth(nil),
+					},
+					NVIndex: tpm2.NamedHandle{
+						Handle: tpmutil.EKCertificateHandleRSA,
+						Name:   tpm2.TPM2BName{},
+					},
+				}
+				tpmTransport := transport.FromReadWriter(sim)
+				_, err := nvUndefine.Execute(tpmTransport)
 				require.NoError(t, err)
 			},
 		},
@@ -625,7 +653,19 @@ func (f keyCloser) Close() error {
 // flush the key once it is no more required.
 // This function is used to out-of-memory the TPM in unit tests.
 func createTPMKey(t *testing.T, sim *tpmsimulator.TPMSimulator) io.Closer {
-	srk, err := client.NewKey(sim, tpm2.HandlePlatform, client.DefaultEKTemplateRSA())
+	tpmTransport := transport.FromReadWriter(sim)
+
+	createPrimary := tpm2.CreatePrimary{
+		PrimaryHandle: tpm2.TPMRHPlatform,
+		InPublic:      tpm2.New2B(tpmutil.DefaultEKTemplateRSA()),
+	}
+
+	rsp, err := createPrimary.Execute(tpmTransport)
 	require.NoError(t, err)
-	return keyCloser(srk.Close)
+
+	handle := rsp.ObjectHandle
+	return keyCloser(func() {
+		flushCtx := tpm2.FlushContext{FlushHandle: handle}
+		_, _ = flushCtx.Execute(tpmTransport)
+	})
 }

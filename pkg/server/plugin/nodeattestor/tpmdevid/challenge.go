@@ -3,13 +3,13 @@ package tpmdevid
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"errors"
 	"fmt"
 
-	"github.com/google/go-tpm/legacy/tpm2"
-	"github.com/google/go-tpm/legacy/tpm2/credactivation"
+	"github.com/google/go-tpm/tpm2"
 	devid "github.com/spiffe/spire/pkg/common/plugin/tpmdevid"
 )
 
@@ -35,50 +35,46 @@ func VerifyDevIDChallenge(cert *x509.Certificate, challenge, response []byte) er
 	return cert.CheckSignature(signAlg, challenge, response)
 }
 
-func NewCredActivationChallenge(akPub, ekPub tpm2.Public) (*devid.CredActivation, []byte, error) {
-	akName, err := akPub.Name()
+func NewCredActivationChallenge(akPub, ekPub tpm2.TPMTPublic) (*devid.CredActivation, []byte, error) {
+	// Compute AK name
+	akName, err := tpm2.ObjectName(&akPub)
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot extract name from AK public: %w", err)
 	}
 
-	hash, err := ekPub.NameAlg.Hash()
+	// Determine hash size
+	hashAlg, err := akPub.NameAlg.Hash()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get hash algorithm: %w", err)
+	}
+	hashSize := hashAlg.Size()
+
+	nonce, err := newNonce(hashSize)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	nonce, err := newNonce(hash.Size())
+	// Convert EK public key to LabeledEncapsulationKey
+	encKey, err := tpm2.ImportEncapsulationKey(&ekPub)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to import EK as encapsulation key: %w", err)
 	}
 
-	encKey, err := ekPub.Key()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	var symBlockSize int
-	switch encKey.(type) {
-	case *rsa.PublicKey:
-		symBlockSize = int(ekPub.RSAParameters.Symmetric.KeyBits) / 8
-
-	default:
-		return nil, nil, errors.New("unsupported algorithm")
-	}
-
-	credentialBlob, secret, err := credactivation.Generate(
-		akName.Digest,
+	// Generate credential activation challenge
+	credentialBlob, secret, err := tpm2.CreateCredential(
+		rand.Reader,
 		encKey,
-		symBlockSize,
+		akName.Buffer,
 		nonce,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to create credential: %w", err)
 	}
 
 	return &devid.CredActivation{
-		Credential: credentialBlob[2:],
-		Secret:     secret[2:],
-	}, nonce, err
+		Credential: credentialBlob,
+		Secret:     secret,
+	}, nonce, nil
 }
 
 func VerifyCredActivationChallenge(expectedNonce, responseNonce []byte) error {

@@ -3,15 +3,18 @@ package tpmdevid
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"sync"
 
-	"github.com/google/go-tpm/legacy/tpm2"
+	"github.com/google/go-tpm/tpm2"
 	"github.com/hashicorp/hcl"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	nodeattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/nodeattestor/v1"
@@ -283,24 +286,24 @@ func verifyDevIDResidency(attData *common_devid.AttestationRequest, ekRoots *x50
 		return nil, nil, status.Errorf(codes.InvalidArgument, "cannot parse endorsement certificate: %v", err)
 	}
 
-	devIDPub, err := tpm2.DecodePublic(attData.DevIDPub)
+	devIDPub, err := tpm2.Unmarshal[tpm2.TPMTPublic](attData.DevIDPub)
 	if err != nil {
 		return nil, nil, status.Errorf(codes.InvalidArgument, "cannot decode DevID key public blob: %v", err)
 	}
 
-	akPub, err := tpm2.DecodePublic(attData.AKPub)
+	akPub, err := tpm2.Unmarshal[tpm2.TPMTPublic](attData.AKPub)
 	if err != nil {
 		return nil, nil, status.Errorf(codes.InvalidArgument, "cannot decode attestation key public blob: %v", err)
 	}
 
-	ekPub, err := tpm2.DecodePublic(attData.EKPub)
+	ekPub, err := tpm2.Unmarshal[tpm2.TPMTPublic](attData.EKPub)
 	if err != nil {
 		return nil, nil, status.Error(codes.InvalidArgument, "cannot decode endorsement key public blob")
 	}
 
 	// Verify the public part of the EK generated from the template is the same
 	// as the one in the EK certificate.
-	err = verifyEKsMatch(ekCert, ekPub)
+	err = verifyEKsMatch(ekCert, *ekPub)
 	if err != nil {
 		return nil, nil, status.Errorf(codes.InvalidArgument, "public key in EK certificate differs from public key created via EK template: %v", err)
 	}
@@ -312,13 +315,13 @@ func verifyDevIDResidency(attData *common_devid.AttestationRequest, ekRoots *x50
 	}
 
 	// Verify DevID resides in the same TPM than AK
-	err = VerifyDevIDCertification(&akPub, &devIDPub, attData.CertifiedDevID, attData.CertificationSignature)
+	err = VerifyDevIDCertification(*akPub, *devIDPub, attData.CertifiedDevID, attData.CertificationSignature)
 	if err != nil {
 		return nil, nil, status.Errorf(codes.InvalidArgument, "cannot verify that DevID is in the same TPM than AK: %v", err)
 	}
 
 	// Issue a credential activation challenge (to verify AK is in the same TPM as EK)
-	challenge, nonce, err := NewCredActivationChallenge(akPub, ekPub)
+	challenge, nonce, err := NewCredActivationChallenge(*akPub, *ekPub)
 	if err != nil {
 		return nil, nil, status.Errorf(codes.Internal, "cannot generate credential activation challenge: %v", err)
 	}
@@ -373,20 +376,27 @@ func verifyEKSignature(ekCert *x509.Certificate, roots *x509.CertPool) error {
 
 // verifyEKsMatch checks that the public key generated using the EK template
 // matches the public key included in the Endorsement Certificate.
-func verifyEKsMatch(ekCert *x509.Certificate, ekPub tpm2.Public) error {
+func verifyEKsMatch(ekCert *x509.Certificate, ekPub tpm2.TPMTPublic) error {
 	keyFromCert, ok := ekCert.PublicKey.(*rsa.PublicKey)
 	if !ok {
 		return errors.New("key from certificate is not an RSA key")
 	}
 
-	cryptoKey, err := ekPub.Key()
+	// Get RSA parameters from the public key
+	rsaDetail, err := ekPub.Parameters.RSADetail()
 	if err != nil {
-		return fmt.Errorf("cannot get template key: %w", err)
+		return fmt.Errorf("cannot get RSA parameters: %w", err)
 	}
 
-	keyFromTemplate, ok := cryptoKey.(*rsa.PublicKey)
-	if !ok {
-		return errors.New("key from template is not an RSA key")
+	uniqueRSA, err := ekPub.Unique.RSA()
+	if err != nil {
+		return fmt.Errorf("cannot get RSA unique: %w", err)
+	}
+
+	// Convert TPM public key to Go crypto public key
+	keyFromTemplate, err := tpm2.RSAPub(rsaDetail, uniqueRSA)
+	if err != nil {
+		return fmt.Errorf("cannot convert TPM RSA public key: %w", err)
 	}
 
 	if keyFromCert.E != keyFromTemplate.E {
@@ -400,93 +410,159 @@ func verifyEKsMatch(ekCert *x509.Certificate, ekPub tpm2.Public) error {
 	return nil
 }
 
-func VerifyDevIDCertification(pubAK, pubDevID *tpm2.Public, attestData, attestSig []byte) error {
+func VerifyDevIDCertification(pubAK, pubDevID tpm2.TPMTPublic, attestData, attestSig []byte) error {
 	err := checkSignature(pubAK, attestData, attestSig)
 	if err != nil {
 		return err
 	}
 
-	data, err := tpm2.DecodeAttestationData(attestData)
+	data, err := tpm2.Unmarshal[tpm2.TPMSAttest](attestData)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to unmarshal attestation data: %w", err)
 	}
 
-	if data.AttestedCertifyInfo == nil {
+	certifyInfo, err := data.Attested.Certify()
+	if err != nil {
 		return errors.New("missing certify info")
 	}
 
-	ok, err := data.AttestedCertifyInfo.Name.MatchesPublic(*pubDevID)
+	// Compute name of DevID public key
+	devIDName, err := tpm2.ObjectName(&pubDevID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to compute DevID name: %w", err)
 	}
 
-	if !ok {
-		return errors.New("certify failed")
+	// Compare names
+	if !bytes.Equal(certifyInfo.Name.Buffer, devIDName.Buffer) {
+		return errors.New("certify failed: names do not match")
 	}
 
 	return nil
 }
 
-func checkSignature(pub *tpm2.Public, data, sigRaw []byte) error {
-	key, err := pub.Key()
+func checkSignature(pub tpm2.TPMTPublic, data, sigRaw []byte) error {
+	// Unmarshal the signature
+	sig, err := tpm2.Unmarshal[tpm2.TPMTSignature](sigRaw)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to unmarshal signature: %w", err)
 	}
 
-	rsaKey, ok := key.(*rsa.PublicKey)
-	if !ok {
-		return errors.New("only RSA keys are supported")
+	// Verify based on key type
+	switch pub.Type {
+	case tpm2.TPMAlgRSA:
+		return verifyRSASignature(&pub, data, sig)
+	case tpm2.TPMAlgECC:
+		return verifyECDSASignature(&pub, data, sig)
+	default:
+		return fmt.Errorf("unsupported key type: 0x%04x", pub.Type)
 	}
-
-	sigScheme, err := getSignatureScheme(*pub)
-	if err != nil {
-		return err
-	}
-
-	hash, err := sigScheme.Hash.Hash()
-	if err != nil {
-		return err
-	}
-
-	h := hash.New()
-	if _, err = h.Write(data); err != nil {
-		return err
-	}
-
-	hashed := h.Sum(nil)
-
-	sig, err := tpm2.DecodeSignature(bytes.NewBuffer(sigRaw))
-	if err != nil {
-		return err
-	}
-
-	return rsa.VerifyPKCS1v15(rsaKey, hash, hashed, sig.RSA.Signature)
 }
 
-func getSignatureScheme(pub tpm2.Public) (*tpm2.SigScheme, error) {
-	canSign := (pub.Attributes & tpm2.FlagSign) == tpm2.FlagSign
-	if !canSign {
-		return nil, errors.New("not a signing key")
+func verifyRSASignature(pub *tpm2.TPMTPublic, data []byte, sig *tpm2.TPMTSignature) error {
+	// Get RSA details and convert to Go public key
+	rsaDetail, err := pub.Parameters.RSADetail()
+	if err != nil {
+		return fmt.Errorf("failed to get RSA details: %w", err)
 	}
 
-	switch pub.Type {
-	case tpm2.AlgRSA:
-		params := pub.RSAParameters
-		if params == nil {
-			return nil, errors.New("malformed key")
+	uniqueRSA, err := pub.Unique.RSA()
+	if err != nil {
+		return fmt.Errorf("failed to get RSA unique: %w", err)
+	}
+
+	rsaPub, err := tpm2.RSAPub(rsaDetail, uniqueRSA)
+	if err != nil {
+		return fmt.Errorf("failed to convert TPM RSA public key: %w", err)
+	}
+
+	// Get the signature bytes
+	var sigBytes []byte
+	switch sig.SigAlg {
+	case tpm2.TPMAlgRSASSA:
+		rsaSig, err := sig.Signature.RSASSA()
+		if err != nil {
+			return fmt.Errorf("failed to get RSASSA signature: %w", err)
 		}
-
-		return params.Sign, nil
-
-	case tpm2.AlgECDSA:
-		params := pub.ECCParameters
-		if params == nil {
-			return nil, errors.New("malformed key")
+		sigBytes = rsaSig.Sig.Buffer
+	case tpm2.TPMAlgRSAPSS:
+		rsaSig, err := sig.Signature.RSAPSS()
+		if err != nil {
+			return fmt.Errorf("failed to get RSAPSS signature: %w", err)
 		}
-
-		return params.Sign, nil
-
+		sigBytes = rsaSig.Sig.Buffer
 	default:
-		return nil, fmt.Errorf("unsupported key type 0x%04x", pub.Type)
+		return fmt.Errorf("unsupported RSA signature algorithm: 0x%04x", sig.SigAlg)
 	}
+
+	// Get hash algorithm
+	var hashAlg crypto.Hash
+	switch sig.SigAlg {
+	case tpm2.TPMAlgRSASSA:
+		scheme, _ := sig.Signature.RSASSA()
+		hashAlg, err = scheme.Hash.Hash()
+		if err != nil {
+			return fmt.Errorf("failed to get hash algorithm: %w", err)
+		}
+	case tpm2.TPMAlgRSAPSS:
+		scheme, _ := sig.Signature.RSAPSS()
+		hashAlg, err = scheme.Hash.Hash()
+		if err != nil {
+			return fmt.Errorf("failed to get hash algorithm: %w", err)
+		}
+	}
+
+	// Hash the data
+	hasher := hashAlg.New()
+	hasher.Write(data)
+	digest := hasher.Sum(nil)
+
+	// Verify the signature
+	return rsa.VerifyPKCS1v15(rsaPub, hashAlg, digest, sigBytes)
+}
+
+func verifyECDSASignature(pub *tpm2.TPMTPublic, data []byte, sig *tpm2.TPMTSignature) error {
+	// Get ECC details
+	eccDetail, err := pub.Parameters.ECCDetail()
+	if err != nil {
+		return fmt.Errorf("failed to get ECC details: %w", err)
+	}
+
+	uniqueECC, err := pub.Unique.ECC()
+	if err != nil {
+		return fmt.Errorf("failed to get ECC unique: %w", err)
+	}
+
+	// Convert to Go ECDSA public key
+	eccPub, err := tpm2.ECDSAPub(eccDetail, uniqueECC)
+	if err != nil {
+		return fmt.Errorf("failed to convert TPM ECDSA public key: %w", err)
+	}
+
+	// Get the signature
+	eccSig, err := sig.Signature.ECDSA()
+	if err != nil {
+		return fmt.Errorf("failed to get ECDSA signature: %w", err)
+	}
+
+	// Get hash algorithm
+	hashAlg, err := eccSig.Hash.Hash()
+	if err != nil {
+		return fmt.Errorf("failed to get hash algorithm: %w", err)
+	}
+
+	// Hash the data
+	hasher := hashAlg.New()
+	hasher.Write(data)
+	digest := hasher.Sum(nil)
+
+	// Convert signature components to big.Int
+	r := new(big.Int).SetBytes(eccSig.SignatureR.Buffer)
+	s := new(big.Int).SetBytes(eccSig.SignatureS.Buffer)
+
+	// Verify the signature
+	if !ecdsa.Verify(eccPub, digest, r, s) {
+		return errors.New("ECDSA signature verification failed")
+	}
+
+	return nil
 }

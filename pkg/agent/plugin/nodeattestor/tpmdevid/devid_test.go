@@ -13,7 +13,8 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/google/go-tpm/legacy/tpm2"
+	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/hashicorp/go-hclog"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
@@ -52,6 +53,19 @@ var (
 	isWindows     = runtime.GOOS == "windows"
 )
 
+// tpmCloser wraps a transport.TPM and io.Closer to implement transport.TPMCloser
+type tpmCloser struct {
+	transport.TPM
+	io.Closer
+}
+
+func newTPMCloser(rwc io.ReadWriteCloser) transport.TPMCloser {
+	return &tpmCloser{
+		TPM:    transport.FromReadWriter(rwc),
+		Closer: rwc,
+	}
+}
+
 // openSimulatedTPM works in the same way than tpmutil.OpenTPM() but it ignores
 // the path argument and opens a connection to a simulated TPM.
 func setupSimulator(t *testing.T) *tpmsimulator.TPMSimulator {
@@ -63,8 +77,12 @@ func setupSimulator(t *testing.T) *tpmsimulator.TPMSimulator {
 	})
 
 	// Override OpenTPM fuction to use a simulator instead of a physical TPM
-	tpmutil.OpenTPM = func(s ...string) (io.ReadWriteCloser, error) {
-		return sim.OpenTPM(s...)
+	tpmutil.OpenTPM = func(s ...string) (transport.TPMCloser, error) {
+		rwc, err := sim.OpenTPM(s...)
+		if err != nil {
+			return nil, err
+		}
+		return newTPMCloser(rwc), nil
 	}
 
 	// Create DevID with intermediate cert
@@ -479,7 +497,19 @@ func TestAidAttestationFailures(t *testing.T) {
 
 			if tt.getEKFail {
 				// Remove EK cert from TPM
-				require.NoError(t, tpm2.NVUndefineSpace(sim, "", tpm2.HandlePlatform, tpmutil.EKCertificateHandleRSA))
+				nvUndefine := tpm2.NVUndefineSpace{
+					AuthHandle: tpm2.AuthHandle{
+						Handle: tpm2.TPMRHPlatform,
+						Auth:   tpm2.PasswordAuth(nil),
+					},
+					NVIndex: tpm2.NamedHandle{
+						Handle: tpmutil.EKCertificateHandleRSA,
+						Name:   tpm2.TPM2BName{},
+					},
+				}
+				tpmTransport := transport.FromReadWriter(sim)
+				_, err := nvUndefine.Execute(tpmTransport)
+				require.NoError(t, err)
 			}
 
 			if tt.openTPMFail {
@@ -541,16 +571,16 @@ func TestAidAttestationSucceeds(t *testing.T) {
 	require.NoError(t, err)
 
 	// Extract data required to create the challenges
-	akPub, err := tpm2.DecodePublic(session.GetAKPublic())
+	akPub, err := tpm2.Unmarshal[tpm2.TPMTPublic](session.GetAKPublic())
 	require.NoError(t, err)
 
 	ekPubBytes, err := session.GetEKPublic()
 	require.NoError(t, err)
-	ekPub, err := tpm2.DecodePublic(ekPubBytes)
+	ekPub, err := tpm2.Unmarshal[tpm2.TPMTPublic](ekPubBytes)
 	require.NoError(t, err)
 
 	// Create proof of residency challenge
-	porChallenge, porChallengeExp, err := server_devid.NewCredActivationChallenge(akPub, ekPub)
+	porChallenge, porChallengeExp, err := server_devid.NewCredActivationChallenge(*akPub, *ekPub)
 	require.NoError(t, err)
 
 	// Create proof of possession challenge

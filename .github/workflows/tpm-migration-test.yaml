@@ -1,0 +1,227 @@
+name: TPM Migration Build & Test
+
+on:
+  pull_request:
+    branches:
+      - main
+      - tpm-direct-api-migration
+    paths:
+      - 'pkg/agent/plugin/nodeattestor/tpmdevid/**'
+      - 'pkg/server/plugin/nodeattestor/tpmdevid/**'
+      - 'test/tpmsimulator/**'
+      - 'go.mod'
+      - 'go.sum'
+  push:
+    branches:
+      - tpm-direct-api-migration
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build-tpm-linux:
+    name: Build TPM (${{ matrix.os }} / ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-22.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Setup QEMU (for ARM64 on AMD64)
+        if: matrix.arch == 'arm64' && runner.arch == 'X64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build TPM Agent Plugin (${{ matrix.arch }})
+        env:
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          echo "Building TPM agent plugin for ${{ matrix.os }}/${{ matrix.arch }}"
+          go build -v ./pkg/agent/plugin/nodeattestor/tpmdevid/...
+
+      - name: Build TPM Server Plugin (${{ matrix.arch }})
+        env:
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          echo "Building TPM server plugin for ${{ matrix.os }}/${{ matrix.arch }}"
+          go build -v ./pkg/server/plugin/nodeattestor/tpmdevid/...
+
+      - name: Build TPM Simulator (${{ matrix.arch }})
+        env:
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          echo "Building TPM simulator for ${{ matrix.os }}/${{ matrix.arch }}"
+          go build -v ./test/tpmsimulator/...
+
+      - name: Run TPM Unit Tests (${{ matrix.arch }})
+        if: matrix.arch == 'amd64'  # Only run tests on native arch
+        run: |
+          echo "Running TPM unit tests"
+          go test -v -race ./pkg/agent/plugin/nodeattestor/tpmdevid/...
+          go test -v -race ./pkg/server/plugin/nodeattestor/tpmdevid/...
+          go test -v ./test/tpmsimulator/...
+
+  build-tpm-windows:
+    name: Build TPM (windows / amd64)
+    runs-on: windows-2022
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Build TPM Agent Plugin (windows/amd64)
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          Write-Host "Building TPM agent plugin for windows/amd64"
+          go build -v ./pkg/agent/plugin/nodeattestor/tpmdevid/...
+
+      - name: Build TPM Server Plugin (windows/amd64)
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          Write-Host "Building TPM server plugin for windows/amd64"
+          go build -v ./pkg/server/plugin/nodeattestor/tpmdevid/...
+
+      - name: Build TPM Simulator (windows/amd64)
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          Write-Host "Building TPM simulator for windows/amd64"
+          go build -v ./test/tpmsimulator/...
+
+      - name: Run TPM Unit Tests (windows/amd64)
+        env:
+          CGO_ENABLED: 0
+        run: |
+          Write-Host "Running TPM unit tests"
+          go test -v ./pkg/agent/plugin/nodeattestor/tpmdevid/...
+          go test -v ./pkg/server/plugin/nodeattestor/tpmdevid/...
+          go test -v ./test/tpmsimulator/...
+
+  verify-migration:
+    name: Verify TPM Migration
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Check for legacy TPM imports
+        run: |
+          echo "Checking for legacy go-tpm imports..."
+          if grep -r "github.com/google/go-tpm/legacy/tpm2" pkg/agent/plugin/nodeattestor/tpmdevid pkg/server/plugin/nodeattestor/tpmdevid test/tpmsimulator 2>/dev/null; then
+            echo "ERROR: Found legacy TPM imports that should be migrated"
+            exit 1
+          fi
+          echo "✓ No legacy imports found"
+
+      - name: Verify new API usage
+        run: |
+          echo "Verifying new go-tpm API usage..."
+          # Check that we're using the new transport API
+          if ! grep -r "github.com/google/go-tpm/tpm2/transport" pkg/agent/plugin/nodeattestor/tpmdevid/tpmutil/open.go; then
+            echo "ERROR: New transport API not found in open.go"
+            exit 1
+          fi
+          echo "✓ New transport API is being used"
+
+          # Check that templates.go exists
+          if [ ! -f "pkg/agent/plugin/nodeattestor/tpmdevid/tpmutil/templates.go" ]; then
+            echo "ERROR: templates.go not found"
+            exit 1
+          fi
+          echo "✓ templates.go exists"
+
+      - name: Run go vet
+        run: |
+          go vet ./pkg/agent/plugin/nodeattestor/tpmdevid/...
+          go vet ./pkg/server/plugin/nodeattestor/tpmdevid/...
+          go vet ./test/tpmsimulator/...
+
+      - name: Check Go formatting
+        run: |
+          unformatted=$(gofmt -l pkg/agent/plugin/nodeattestor/tpmdevid pkg/server/plugin/nodeattestor/tpmdevid test/tpmsimulator)
+          if [ -n "$unformatted" ]; then
+            echo "ERROR: Files need formatting:"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "✓ All files are properly formatted"
+
+  test-summary:
+    name: TPM Migration Test Summary
+    runs-on: ubuntu-22.04
+    needs: [build-tpm-linux, build-tpm-windows, verify-migration]
+    if: always()
+
+    steps:
+      - name: Check results
+        run: |
+          if [ "${{ needs.build-tpm-linux.result }}" != "success" ]; then
+            echo "❌ Linux builds failed"
+            exit 1
+          fi
+          if [ "${{ needs.build-tpm-windows.result }}" != "success" ]; then
+            echo "❌ Windows build failed"
+            exit 1
+          fi
+          if [ "${{ needs.verify-migration.result }}" != "success" ]; then
+            echo "❌ Migration verification failed"
+            exit 1
+          fi
+          echo "✅ All TPM migration tests passed!"
+          echo ""
+          echo "Summary:"
+          echo "- ✅ Linux AMD64 build and tests"
+          echo "- ✅ Linux ARM64 build"
+          echo "- ✅ Windows AMD64 build and tests"
+          echo "- ✅ Migration verification"

@@ -14,9 +14,9 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/google/go-tpm-tools/client"
 	"github.com/google/go-tpm-tools/simulator"
-	"github.com/google/go-tpm/legacy/tpm2"
+	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/spiffe/spire/pkg/agent/plugin/nodeattestor/tpmdevid/tpmutil"
 	"github.com/spiffe/spire/pkg/common/pemutil"
 )
@@ -25,6 +25,7 @@ var ErrUsingClosedSimulator = simulator.ErrUsingClosedSimulator
 
 type TPMSimulator struct {
 	*simulator.Simulator
+	tpm                          transport.TPM
 	ekRoot                       *x509.Certificate
 	ownerHierarchyPassword       string
 	endorsementHierarchyPassword string
@@ -61,11 +62,15 @@ var neverExpires = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
 
 // DevID key template attributes according to TPM 2.0 Keys for device identity
 // and attestation (section 7.3.4.1)
-var flagDevIDKeyDefault = tpm2.FlagSign |
-	tpm2.FlagFixedTPM |
-	tpm2.FlagFixedParent |
-	tpm2.FlagSensitiveDataOrigin |
-	tpm2.FlagUserWithAuth
+func devIDObjectAttributes() tpm2.TPMAObject {
+	return tpm2.TPMAObject{
+		FixedTPM:            true,
+		FixedParent:         true,
+		SensitiveDataOrigin: true,
+		UserWithAuth:        true,
+		SignEncrypt:         true,
+	}
+}
 
 // New creates a new TPM simulator and sets an RSA endorsement certificate.
 func New(endorsementHierarchyPassword, ownerHierarchyPassword string) (*TPMSimulator, error) {
@@ -75,14 +80,21 @@ func New(endorsementHierarchyPassword, ownerHierarchyPassword string) (*TPMSimul
 	}
 	sim := &TPMSimulator{
 		Simulator:                    s,
+		tpm:                          transport.FromReadWriter(s),
 		ownerHierarchyPassword:       ownerHierarchyPassword,
 		endorsementHierarchyPassword: endorsementHierarchyPassword,
 	}
 
-	err = tpm2.HierarchyChangeAuth(sim,
-		tpm2.HandleEndorsement,
-		tpm2.AuthCommand{Session: tpm2.HandlePasswordSession},
-		sim.endorsementHierarchyPassword)
+	hierarchyAuthCmd := tpm2.HierarchyChangeAuth{
+		AuthHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHEndorsement,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+		NewAuth: tpm2.TPM2BAuth{
+			Buffer: []byte(sim.endorsementHierarchyPassword),
+		},
+	}
+	_, err = hierarchyAuthCmd.Execute(sim.tpm)
 	if err != nil {
 		return nil, fmt.Errorf("unable to change endorsement hierarchy auth: %w", err)
 	}
@@ -97,10 +109,16 @@ func New(endorsementHierarchyPassword, ownerHierarchyPassword string) (*TPMSimul
 		return nil, fmt.Errorf("unable to set endorsement certificate: %w", err)
 	}
 
-	err = tpm2.HierarchyChangeAuth(sim,
-		tpm2.HandleOwner,
-		tpm2.AuthCommand{Session: tpm2.HandlePasswordSession},
-		sim.ownerHierarchyPassword)
+	ownerAuthCmd := tpm2.HierarchyChangeAuth{
+		AuthHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHOwner,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+		NewAuth: tpm2.TPM2BAuth{
+			Buffer: []byte(sim.ownerHierarchyPassword),
+		},
+	}
+	_, err = ownerAuthCmd.Execute(sim.tpm)
 	if err != nil {
 		return nil, fmt.Errorf("unable to change owner hierarchy auth: %w", err)
 	}
@@ -224,14 +242,42 @@ func (s *TPMSimulator) GenerateDevID(p *ProvisioningAuthority, keyType KeyType, 
 	}
 
 	// Decode public blob returned by TPM to get the public key
-	devIDPublicBlobDecoded, err := tpm2.DecodePublic(publicBlob)
+	devIDPublicBlobDecoded, err := tpm2.Unmarshal[tpm2.TPMTPublic](publicBlob)
 	if err != nil {
 		return nil, fmt.Errorf("unable to decode public blob: %w", err)
 	}
 
-	devIDPublicKey, err := devIDPublicBlobDecoded.Key()
-	if err != nil {
-		return nil, fmt.Errorf("cannot get DevID key: %w", err)
+	// Convert TPM public key to Go crypto public key
+	var devIDPublicKey any
+	switch devIDPublicBlobDecoded.Type {
+	case tpm2.TPMAlgRSA:
+		rsaDetail, err := devIDPublicBlobDecoded.Parameters.RSADetail()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get RSA details: %w", err)
+		}
+		uniqueRSA, err := devIDPublicBlobDecoded.Unique.RSA()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get RSA unique: %w", err)
+		}
+		devIDPublicKey, err = tpm2.RSAPub(rsaDetail, uniqueRSA)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert RSA public key: %w", err)
+		}
+	case tpm2.TPMAlgECC:
+		eccDetail, err := devIDPublicBlobDecoded.Parameters.ECCDetail()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get ECC details: %w", err)
+		}
+		uniqueECC, err := devIDPublicBlobDecoded.Unique.ECC()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get ECC unique: %w", err)
+		}
+		devIDPublicKey, err = tpm2.ECDSAPub(eccDetail, uniqueECC)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert ECC public key: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported key type: 0x%04x", devIDPublicBlobDecoded.Type)
 	}
 
 	// Mint DevID certificate
@@ -260,21 +306,64 @@ func (s *TPMSimulator) GetEKRoot() *x509.Certificate {
 }
 
 func (s *TPMSimulator) SetEndorsementCertificate(ekCert []byte) error {
-	_ = tpm2.NVUndefineSpace(s, "", tpm2.HandlePlatform, tpmutil.EKCertificateHandleRSA)
+	// Try to undefine the space if it already exists (ignore errors)
+	undefineCmd := tpm2.NVUndefineSpace{
+		AuthHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHPlatform,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+		NVIndex: tpm2.NamedHandle{
+			Handle: tpmutil.EKCertificateHandleRSA,
+			Name:   tpm2.TPM2BName{},
+		},
+	}
+	_, _ = undefineCmd.Execute(s.tpm)
 
-	err := tpm2.NVDefineSpace(s,
-		tpm2.HandlePlatform,
-		tpmutil.EKCertificateHandleRSA,
-		"",
-		"",
-		nil,
-		tpm2.AttrPlatformCreate|tpm2.AttrPPWrite|tpm2.AttrPPRead|tpm2.AttrAuthWrite|tpm2.AttrAuthRead,
-		uint16(len(ekCert)))
+	// Define NV space for EK certificate
+	defineCmd := tpm2.NVDefineSpace{
+		AuthHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHPlatform,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+		Auth: tpm2.TPM2BAuth{
+			Buffer: nil,
+		},
+		PublicInfo: tpm2.New2B(tpm2.TPMSNVPublic{
+			NVIndex: tpmutil.EKCertificateHandleRSA,
+			NameAlg: tpm2.TPMAlgSHA256,
+			Attributes: tpm2.TPMANV{
+				PlatformCreate: true,
+				PPWrite:        true,
+				PPRead:         true,
+				AuthWrite:      true,
+				AuthRead:       true,
+				Written:        false,
+			},
+			AuthPolicy: tpm2.TPM2BDigest{},
+			DataSize:   uint16(len(ekCert)),
+		}),
+	}
+	_, err := defineCmd.Execute(s.tpm)
 	if err != nil {
 		return fmt.Errorf("cannot define NV space: %w", err)
 	}
 
-	err = tpm2.NVWrite(s, tpm2.HandlePlatform, tpmutil.EKCertificateHandleRSA, "", ekCert, 0)
+	// Write EK certificate to NV space
+	writeCmd := tpm2.NVWrite{
+		AuthHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHPlatform,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+		NVIndex: tpm2.NamedHandle{
+			Handle: tpmutil.EKCertificateHandleRSA,
+			Name:   tpm2.TPM2BName{},
+		},
+		Data: tpm2.TPM2BMaxNVBuffer{
+			Buffer: ekCert,
+		},
+		Offset: 0,
+	}
+	_, err = writeCmd.Execute(s.tpm)
 	if err != nil {
 		return fmt.Errorf("cannot write data to NV: %w", err)
 	}
@@ -298,28 +387,47 @@ func (s *TPMSimulator) createEndorsementCertificate() (*x509.Certificate, error)
 		return nil, fmt.Errorf("cannot generate root certificate: %w", err)
 	}
 
-	ekHandle, ekPublicBlob, _, _, _, _, err := tpm2.CreatePrimaryEx(s, tpm2.HandleEndorsement,
-		tpm2.PCRSelection{},
-		s.endorsementHierarchyPassword,
-		"",
-		client.DefaultEKTemplateRSA())
+	// Create EK using the new API
+	createEKCmd := tpm2.CreatePrimary{
+		PrimaryHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHEndorsement,
+			Auth:   tpm2.PasswordAuth([]byte(s.endorsementHierarchyPassword)),
+		},
+		InPublic: tpm2.New2B(tpmutil.DefaultEKTemplateRSA()),
+	}
+	createEKRsp, err := createEKCmd.Execute(s.tpm)
 	if err != nil {
 		return nil, fmt.Errorf("cannot generate endorsement key pair: %w", err)
 	}
 
-	err = tpm2.FlushContext(s, ekHandle)
+	// Flush the EK handle
+	flushCmd := tpm2.FlushContext{
+		FlushHandle: createEKRsp.ObjectHandle,
+	}
+	_, err = flushCmd.Execute(s.tpm)
 	if err != nil {
-		return nil, fmt.Errorf("cannot to flush endorsement key handle: %w", err)
+		return nil, fmt.Errorf("cannot flush endorsement key handle: %w", err)
 	}
 
-	ekPublicBlobDecoded, err := tpm2.DecodePublic(ekPublicBlob)
+	// Extract public key from EK
+	ekPublic, err := createEKRsp.OutPublic.Contents()
 	if err != nil {
-		return nil, fmt.Errorf("cannot decode endorsement key public blob: %w", err)
+		return nil, fmt.Errorf("cannot get EK public contents: %w", err)
 	}
 
-	ekPublicKey, err := ekPublicBlobDecoded.Key()
+	rsaDetail, err := ekPublic.Parameters.RSADetail()
 	if err != nil {
-		return nil, fmt.Errorf("cannot get endorsement public key: %w", err)
+		return nil, fmt.Errorf("cannot get RSA details: %w", err)
+	}
+
+	uniqueRSA, err := ekPublic.Unique.RSA()
+	if err != nil {
+		return nil, fmt.Errorf("cannot get RSA unique: %w", err)
+	}
+
+	ekPublicKey, err := tpm2.RSAPub(rsaDetail, uniqueRSA)
+	if err != nil {
+		return nil, fmt.Errorf("cannot convert EK public key: %w", err)
 	}
 
 	return createCertificate(ekPublicKey, &x509.Certificate{
@@ -333,45 +441,78 @@ func (s *TPMSimulator) createEndorsementCertificate() (*x509.Certificate, error)
 // createOrdinaryKey creates an ordinary TPM key of the type keyType under
 // the owner hierarchy
 func (s *TPMSimulator) createOrdinaryKey(keyType KeyType, parentKeyPassword, keyPassword string) ([]byte, []byte, error) {
-	var err error
-	var keyTemplate tpm2.Public
-	var srkTemplate tpm2.Public
+	var keyTemplate tpm2.TPMTPublic
+	var srkTemplate tpm2.TPMTPublic
 	switch keyType {
 	case RSA:
 		keyTemplate = defaultDevIDTemplateRSA()
-		srkTemplate = tpmutil.SRKTemplateHighRSA()
+		srkTemplate = tpmutil.SRKTemplateRSA()
 
 	case ECC:
 		keyTemplate = defaultDevIDTemplateECC()
-		srkTemplate = tpmutil.SRKTemplateHighECC()
+		srkTemplate = tpmutil.SRKTemplateECC()
 
 	default:
 		return nil, nil, fmt.Errorf("unknown key type: %v", keyType)
 	}
 
-	srkHandle, _, _, _, _, _, err := tpm2.CreatePrimaryEx(s, tpm2.HandleOwner, tpm2.PCRSelection{}, s.ownerHierarchyPassword, parentKeyPassword, srkTemplate)
+	// Create SRK
+	createSRKCmd := tpm2.CreatePrimary{
+		PrimaryHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHOwner,
+			Auth:   tpm2.PasswordAuth([]byte(s.ownerHierarchyPassword)),
+		},
+		InPublic: tpm2.New2B(srkTemplate),
+		InSensitive: tpm2.TPM2BSensitiveCreate{
+			Sensitive: &tpm2.TPMSSensitiveCreate{
+				UserAuth: tpm2.TPM2BAuth{
+					Buffer: []byte(parentKeyPassword),
+				},
+			},
+		},
+	}
+	createSRKRsp, err := createSRKCmd.Execute(s.tpm)
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot create new storage root key: %w", err)
 	}
 
-	privateBlob, publicBlob, _, _, _, err := tpm2.CreateKey(
-		s,
-		srkHandle,
-		tpm2.PCRSelection{},
-		parentKeyPassword,
-		keyPassword,
-		keyTemplate,
-	)
+	// Create the key under SRK
+	createKeyCmd := tpm2.Create{
+		ParentHandle: tpm2.AuthHandle{
+			Handle: createSRKRsp.ObjectHandle,
+			Name:   createSRKRsp.Name,
+			Auth:   tpm2.PasswordAuth([]byte(parentKeyPassword)),
+		},
+		InPublic: tpm2.New2B(keyTemplate),
+		InSensitive: tpm2.TPM2BSensitiveCreate{
+			Sensitive: &tpm2.TPMSSensitiveCreate{
+				UserAuth: tpm2.TPM2BAuth{
+					Buffer: []byte(keyPassword),
+				},
+			},
+		},
+	}
+	createKeyRsp, err := createKeyCmd.Execute(s.tpm)
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot create key: %w", err)
 	}
 
-	err = tpm2.FlushContext(s, srkHandle)
+	// Flush SRK handle
+	flushCmd := tpm2.FlushContext{
+		FlushHandle: createSRKRsp.ObjectHandle,
+	}
+	_, err = flushCmd.Execute(s.tpm)
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot flush storage root key handle: %w", err)
 	}
 
-	return privateBlob, publicBlob, nil
+	// Get the inner TPMTPublic from the TPM2BPublic wrapper
+	publicContents, err := createKeyRsp.OutPublic.Contents()
+	if err != nil {
+		return nil, nil, fmt.Errorf("cannot get public key contents: %w", err)
+	}
+
+	return createKeyRsp.OutPrivate.Buffer, tpm2.Marshal(*publicContents), nil
 }
 
 func (p *ProvisioningAuthority) issueCertificate(publicKey any) (*x509.Certificate, error) {
@@ -417,14 +558,14 @@ func generateRSAKey() (*rsa.PrivateKey, error) {
 	return rsa.GenerateKey(rand.Reader, 2048)
 }
 
-func defaultDevIDTemplateRSA() tpm2.Public {
-	devIDKeyTemplateRSA := client.AKTemplateRSA()
-	devIDKeyTemplateRSA.Attributes = flagDevIDKeyDefault
+func defaultDevIDTemplateRSA() tpm2.TPMTPublic {
+	devIDKeyTemplateRSA := tpmutil.AKTemplateRSA()
+	devIDKeyTemplateRSA.ObjectAttributes = devIDObjectAttributes()
 	return devIDKeyTemplateRSA
 }
 
-func defaultDevIDTemplateECC() tpm2.Public {
-	devIDKeyTemplateECC := client.AKTemplateECC()
-	devIDKeyTemplateECC.Attributes = flagDevIDKeyDefault
+func defaultDevIDTemplateECC() tpm2.TPMTPublic {
+	devIDKeyTemplateECC := tpmutil.AKTemplateECC()
+	devIDKeyTemplateECC.ObjectAttributes = devIDObjectAttributes()
 	return devIDKeyTemplateECC
 }
