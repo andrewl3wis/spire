@@ -43,6 +43,11 @@ func builtin(p *Plugin) catalog.BuiltIn {
 type Config struct {
 	DevIDBundlePath       string `hcl:"devid_ca_path"`
 	EndorsementBundlePath string `hcl:"endorsement_ca_path"`
+	// AllowEKCertFallback allows attestation to proceed without EK certificates.
+	// When true, if EK cert is not provided by the agent, proof-of-residency is skipped
+	// and only proof-of-possession (DevID signature) is verified.
+	// When false (default), EK cert is required for full attestation.
+	AllowEKCertFallback bool `hcl:"allow_ek_cert_fallback"`
 }
 
 type config struct {
@@ -50,6 +55,8 @@ type config struct {
 
 	devIDRoots *x509.CertPool
 	ekRoots    *x509.CertPool
+
+	allowEKCertFallback bool
 }
 
 func buildConfig(coreConfig catalog.CoreConfig, hclText string, status *pluginconf.Status) *config {
@@ -68,7 +75,8 @@ func buildConfig(coreConfig catalog.CoreConfig, hclText string, status *pluginco
 
 	// Create initial internal configuration
 	newConfig := &config{
-		trustDomain: coreConfig.TrustDomain,
+		trustDomain:         coreConfig.TrustDomain,
+		allowEKCertFallback: hclConfig.AllowEKCertFallback,
 	}
 
 	// Load DevID bundle
@@ -154,12 +162,23 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 		return status.Errorf(codes.Internal, "unable to generate challenge: %v", err)
 	}
 
-	// Verify DevID residency
+	// Verify DevID residency (optional - only if EK info is provided)
 	var nonce []byte
 	var credActivationChallenge *common_devid.CredActivation
-	credActivationChallenge, nonce, err = verifyDevIDResidency(attData, conf.ekRoots)
-	if err != nil {
-		return err
+	if hasEKInfo(attData) {
+		// Full attestation: perform proof-of-residency
+		credActivationChallenge, nonce, err = verifyDevIDResidency(attData, conf.ekRoots)
+		if err != nil {
+			return err
+		}
+	} else if !conf.allowEKCertFallback {
+		// EK cert required by policy but not provided by agent
+		return status.Error(codes.InvalidArgument, "EK certificate is required but was not provided by agent. Set allow_ek_cert_fallback=true in server config to allow attestation without EK certificates.")
+	} else {
+		// Fallback allowed: skip proof-of-residency, only do proof-of-possession
+		// This is common with Intel fTPM which doesn't provision EK certs to NV indexes
+		credActivationChallenge = nil
+		nonce = nil
 	}
 
 	// Marshal challenges
@@ -199,10 +218,12 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 		return status.Errorf(codes.InvalidArgument, "devID challenge verification failed: %v", err)
 	}
 
-	// Verify credential activation challenge
-	err = VerifyCredActivationChallenge(nonce, challengeResponse.CredActivation)
-	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "credential activation failed: %v", err)
+	// Verify credential activation challenge (only if it was sent)
+	if credActivationChallenge != nil {
+		err = VerifyCredActivationChallenge(nonce, challengeResponse.CredActivation)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "credential activation failed: %v", err)
+		}
 	}
 
 	// Create SPIFFE ID and selectors
@@ -324,6 +345,13 @@ func verifyDevIDResidency(attData *common_devid.AttestationRequest, ekRoots *x50
 	}
 
 	return challenge, nonce, nil
+}
+
+// hasEKInfo checks if the attestation request contains EK information.
+// Returns true if the agent provided EK data for proof-of-residency.
+func hasEKInfo(attReq *common_devid.AttestationRequest) bool {
+	// Check only EK-specific fields (not DevIDPub which is always present)
+	return len(attReq.EKCert) > 0 || len(attReq.EKPub) > 0 || len(attReq.AKPub) > 0
 }
 
 func isDevIDResidencyInfoComplete(attReq *common_devid.AttestationRequest) error {
